@@ -2,18 +2,20 @@ package hypervisor
 
 import (
 	"errors"
+
+	"github.com/hyperhq/runv/api"
 	"github.com/hyperhq/runv/hypervisor/network"
-	"github.com/hyperhq/runv/hypervisor/pod"
 	"github.com/hyperhq/runv/hypervisor/types"
-	"os"
+	"github.com/hyperhq/runv/lib/vsock"
 )
 
 type BootConfig struct {
 	CPU              int
 	Memory           int
-	HotAddCpuMem     bool
 	BootToBeTemplate bool
 	BootFromTemplate bool
+	EnableVsock      bool
+	EnableVhostUser  bool
 	MemoryPath       string
 	DevicesStatePath string
 	Kernel           string
@@ -30,11 +32,12 @@ type BootConfig struct {
 }
 
 type HostNicInfo struct {
-	Fd      uint64
+	Id      string
 	Device  string
 	Mac     string
 	Bridge  string
 	Gateway string
+	Options string
 }
 
 type GuestNicInfo struct {
@@ -50,43 +53,49 @@ type HypervisorDriver interface {
 
 	LoadContext(persisted map[string]interface{}) (DriverContext, error)
 
-	BuildinNetwork() bool
+	SupportLazyMode() bool
+	SupportVmSocket() bool
+}
+
+type BuildinNetworkDriver interface {
+	HypervisorDriver
 
 	InitNetwork(bIface, bIP string, disableIptables bool) error
-
-	SupportLazyMode() bool
 }
 
 var HDriver HypervisorDriver
+var VsockCidManager vsock.VsockCidAllocator
 
 type DriverContext interface {
 	Launch(ctx *VmContext)
 	Associate(ctx *VmContext)
 	Dump() (map[string]interface{}, error)
 
-	AddDisk(ctx *VmContext, sourceType string, blockInfo *BlockDescriptor)
-	RemoveDisk(ctx *VmContext, blockInfo *BlockDescriptor, callback VmEvent)
+	AddDisk(ctx *VmContext, sourceType string, blockInfo *DiskDescriptor, result chan<- VmEvent)
+	RemoveDisk(ctx *VmContext, blockInfo *DiskDescriptor, callback VmEvent, result chan<- VmEvent)
 
 	AddNic(ctx *VmContext, host *HostNicInfo, guest *GuestNicInfo, result chan<- VmEvent)
-	RemoveNic(ctx *VmContext, n *InterfaceCreated, callback VmEvent)
+	RemoveNic(ctx *VmContext, n *InterfaceCreated, callback VmEvent, result chan<- VmEvent)
 
-	SetCpus(ctx *VmContext, cpus int, result chan<- error)
-	AddMem(ctx *VmContext, slot, size int, result chan<- error)
+	SetCpus(ctx *VmContext, cpus int) error
+	AddMem(ctx *VmContext, slot, size int) error
 
-	Save(ctx *VmContext, path string, result chan<- error)
+	Save(ctx *VmContext, path string) error
 
 	Shutdown(ctx *VmContext)
 	Kill(ctx *VmContext)
 
-	Pause(ctx *VmContext, pause bool, result chan<- error)
-
-	ConfigureNetwork(vmId, requestedIP string, maps []pod.UserContainerPort, config pod.UserInterface) (*network.Settings, error)
-	AllocateNetwork(vmId, requestedIP string, maps []pod.UserContainerPort) (*network.Settings, error)
-	ReleaseNetwork(vmId, releasedIP string, maps []pod.UserContainerPort, file *os.File) error
+	Pause(ctx *VmContext, pause bool) error
 
 	Stats(ctx *VmContext) (*types.PodStats, error)
 
 	Close()
+}
+
+type ConsoleDriverContext interface {
+	DriverContext
+
+	ConnectConsole(console chan<- string) error
 }
 
 type LazyDriverContext interface {
@@ -125,6 +134,10 @@ func (ed *EmptyDriver) SupportLazyMode() bool {
 	return false
 }
 
+func (ed *EmptyDriver) SupportVmSocket() bool {
+	return false
+}
+
 func (ec *EmptyContext) Launch(ctx *VmContext) {}
 
 func (ec *EmptyContext) Associate(ctx *VmContext) {}
@@ -133,42 +146,36 @@ func (ec *EmptyContext) Dump() (map[string]interface{}, error) {
 	return map[string]interface{}{"hypervisor": "empty"}, nil
 }
 
-func (ec *EmptyContext) AddDisk(ctx *VmContext, sourceType string, blockInfo *BlockDescriptor) {}
+func (ec *EmptyContext) AddDisk(ctx *VmContext, sourceType string, blockInfo *DiskDescriptor, result chan<- VmEvent) {
+}
 
-func (ec *EmptyContext) RemoveDisk(ctx *VmContext, blockInfo *BlockDescriptor, callback VmEvent) {
+func (ec *EmptyContext) RemoveDisk(ctx *VmContext, blockInfo *DiskDescriptor, callback VmEvent, result chan<- VmEvent) {
 }
 
 func (ec *EmptyContext) AddNic(ctx *VmContext, host *HostNicInfo, guest *GuestNicInfo, result chan<- VmEvent) {
 }
 
-func (ec *EmptyContext) RemoveNic(ctx *VmContext, n *InterfaceCreated, callback VmEvent) {}
-
-func (ec *EmptyContext) SetCpus(ctx *VmContext, cpus int, result chan<- error) {}
-func (ec *EmptyContext) AddMem(ctx *VmContext, slot, size int, result chan<- error) {
+func (ec *EmptyContext) RemoveNic(ctx *VmContext, n *InterfaceCreated, callback VmEvent, result chan<- VmEvent) {
 }
 
-func (ec *EmptyContext) Save(ctx *VmContext, path string, result chan<- error) {}
+func (ec *EmptyContext) SetCpus(ctx *VmContext, cpus int) error      { return nil }
+func (ec *EmptyContext) AddMem(ctx *VmContext, slot, size int) error { return nil }
+
+func (ec *EmptyContext) Save(ctx *VmContext, path string) error { return nil }
 
 func (ec *EmptyContext) Shutdown(ctx *VmContext) {}
 
 func (ec *EmptyContext) Kill(ctx *VmContext) {}
 
-func (ec *EmptyContext) Pause(ctx *VmContext, pause bool, result chan<- error) {}
+func (ec *EmptyContext) Pause(ctx *VmContext, pause bool) error { return nil }
 
 func (ec *EmptyContext) BuildinNetwork() bool { return false }
 
-func (ec *EmptyContext) ConfigureNetwork(vmId, requestedIP string,
-	maps []pod.UserContainerPort, config pod.UserInterface) (*network.Settings, error) {
+func (ec *EmptyContext) ConfigureNetwork(config *api.InterfaceDescription) (*network.Settings, error) {
 	return nil, nil
 }
 
-func (ec *EmptyContext) AllocateNetwork(vmId, requestedIP string,
-	maps []pod.UserContainerPort) (*network.Settings, error) {
-	return nil, nil
-}
-
-func (ec *EmptyContext) ReleaseNetwork(vmId, releasedIP string,
-	maps []pod.UserContainerPort, file *os.File) error {
+func (ec *EmptyContext) ReleaseNetwork(releasedIP string) error {
 	return nil
 }
 

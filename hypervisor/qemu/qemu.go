@@ -1,3 +1,5 @@
+// +build linux
+
 package qemu
 
 import (
@@ -6,8 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/hypervisor"
@@ -17,6 +21,7 @@ import (
 //implement the hypervisor.HypervisorDriver interface
 type QemuDriver struct {
 	executable string
+	hasVsock   bool
 }
 
 //implement the hypervisor.DriverContext interface
@@ -42,8 +47,15 @@ func InitDriver() *QemuDriver {
 		return nil
 	}
 
+	var hasVsock bool
+	_, err = exec.Command("/sbin/modprobe", "vhost_vsock").Output()
+	if err == nil {
+		hasVsock = true
+	}
+
 	return &QemuDriver{
 		executable: cmd,
+		hasVsock:   hasVsock,
 	}
 }
 
@@ -56,7 +68,7 @@ func (qd *QemuDriver) InitContext(homeDir string) hypervisor.DriverContext {
 		os.Mkdir(QemuLogDir, 0755)
 	}
 
-	logFile := QemuLogDir + "/" + homeDir[strings.Index(homeDir, "vm-"):len(homeDir)-1] + ".log"
+	logFile := filepath.Join(QemuLogDir, homeDir[strings.Index(homeDir, "vm-"):len(homeDir)-1]+".log")
 	if _, err := os.Create(logFile); err != nil {
 		glog.Errorf("create qemu log file failed: %v", err)
 	}
@@ -70,8 +82,8 @@ func (qd *QemuDriver) InitContext(homeDir string) hypervisor.DriverContext {
 		qmp:         make(chan QmpInteraction, 128),
 		wdt:         make(chan string, 16),
 		waitQmp:     make(chan int, 1),
-		qmpSockName: homeDir + QmpSockName,
-		qemuPidFile: homeDir + QemuPidFile,
+		qmpSockName: filepath.Join(homeDir, QmpSockName),
+		qemuPidFile: filepath.Join(homeDir, QemuPidFile),
 		qemuLogFile: qemuLogFile,
 		process:     nil,
 	}
@@ -108,6 +120,10 @@ func (qd *QemuDriver) LoadContext(persisted map[string]interface{}) (hypervisor.
 			proc, err = os.FindProcess(int(p.(float64)))
 			if err != nil {
 				return nil, err
+			}
+			// test if process has already exited
+			if err = proc.Signal(syscall.Signal(0)); err != nil {
+				return nil, fmt.Errorf("signal 0 on Qemu process(%d) failed: %v", int(p.(float64)), err)
 			}
 		default:
 			return nil, errors.New("wrong pid field type in persist info")
@@ -177,6 +193,7 @@ func (qc *QemuContext) Stats(ctx *hypervisor.VmContext) (*types.PodStats, error)
 }
 
 func (qc *QemuContext) Close() {
+	qc.qmp <- &QmpQuit{}
 	qc.wdt <- "quit"
 	<-qc.waitQmp
 	qc.qemuLogFile.Close()
@@ -184,7 +201,7 @@ func (qc *QemuContext) Close() {
 	close(qc.wdt)
 }
 
-func (qc *QemuContext) Pause(ctx *hypervisor.VmContext, pause bool, result chan<- error) {
+func (qc *QemuContext) Pause(ctx *hypervisor.VmContext, pause bool) error {
 	commands := make([]*QmpCommand, 1)
 
 	if pause {
@@ -197,19 +214,21 @@ func (qc *QemuContext) Pause(ctx *hypervisor.VmContext, pause bool, result chan<
 		}
 	}
 
+	result := make(chan error, 1)
 	qc.qmp <- &QmpSession{
 		commands: commands,
 		respond: func(err error) {
 			result <- err
 		},
 	}
+	return <-result
 }
 
-func (qc *QemuContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.BlockDescriptor) {
-	name := blockInfo.Name
+func (qc *QemuContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.DiskDescriptor, result chan<- hypervisor.VmEvent) {
 	filename := blockInfo.Filename
 	format := blockInfo.Format
 	id := blockInfo.ScsiId
+	readonly := blockInfo.ReadOnly
 
 	if format == "rbd" {
 		if blockInfo.Options != nil {
@@ -231,32 +250,60 @@ func (qc *QemuContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blo
 		}
 	}
 
-	newDiskAddSession(ctx, qc, name, sourceType, filename, format, id)
+	newDiskAddSession(ctx, qc, filename, format, id, readonly, result)
 }
 
-func (qc *QemuContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.BlockDescriptor, callback hypervisor.VmEvent) {
+func (qc *QemuContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.DiskDescriptor, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	id := blockInfo.ScsiId
 
-	newDiskDelSession(ctx, qc, id, callback)
+	newDiskDelSession(ctx, qc, id, callback, result)
 }
 
 func (qc *QemuContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNicInfo, guest *hypervisor.GuestNicInfo, result chan<- hypervisor.VmEvent) {
-	newNetworkAddSession(ctx, qc, host.Fd, guest.Device, host.Mac, guest.Index, guest.Busaddr, result)
+	var (
+		fd       int = -1
+		err      error
+		waitChan chan hypervisor.VmEvent = make(chan hypervisor.VmEvent, 1)
+	)
+
+	if ctx.Boot.EnableVhostUser {
+		err = GetVhostUserPort(host.Device, host.Bridge, ctx.HomeDir, host.Options)
+	} else {
+		fd, err = GetTapFd(host.Device, host.Bridge, host.Options)
+	}
+
+	if err != nil {
+		glog.Error("fail to create nic for sandbox: %v, %v", ctx.Id, err)
+		result <- &hypervisor.DeviceFailed{
+			Session: nil,
+		}
+		return
+	}
+
+	go func() {
+		// close tap file if necessary
+		ev, ok := <-waitChan
+		syscall.Close(fd)
+		if !ok {
+			close(result)
+		} else {
+			result <- ev
+		}
+	}()
+	newNetworkAddSession(ctx, qc, host.Id, fd, guest.Device, host.Mac, guest.Index, guest.Busaddr, waitChan)
 }
 
-func (qc *QemuContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent) {
-	newNetworkDelSession(ctx, qc, n.DeviceName, callback)
+func (qc *QemuContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
+	newNetworkDelSession(ctx, qc, n.DeviceName, callback, result)
 }
 
-func (qc *QemuContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<- error) {
+func (qc *QemuContext) SetCpus(ctx *hypervisor.VmContext, cpus int) error {
 	currcpus := qc.cpus
 
 	if cpus < currcpus {
-		result <- fmt.Errorf("can't reduce cpus number from %d to %d", currcpus, cpus)
-		return
+		return fmt.Errorf("can't reduce cpus number from %d to %d", currcpus, cpus)
 	} else if cpus == currcpus {
-		result <- nil
-		return
+		return nil
 	}
 
 	commands := make([]*QmpCommand, cpus-currcpus)
@@ -269,6 +316,7 @@ func (qc *QemuContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<
 		}
 	}
 
+	result := make(chan error, 1)
 	qc.qmp <- &QmpSession{
 		commands: commands,
 		respond: func(err error) {
@@ -278,9 +326,10 @@ func (qc *QemuContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<
 			result <- err
 		},
 	}
+	return <-result
 }
 
-func (qc *QemuContext) AddMem(ctx *hypervisor.VmContext, slot, size int, result chan<- error) {
+func (qc *QemuContext) AddMem(ctx *hypervisor.VmContext, slot, size int) error {
 	commands := make([]*QmpCommand, 2)
 	commands[0] = &QmpCommand{
 		Execute: "object-add",
@@ -298,13 +347,15 @@ func (qc *QemuContext) AddMem(ctx *hypervisor.VmContext, slot, size int, result 
 			"memdev": "mem" + strconv.Itoa(slot),
 		},
 	}
+	result := make(chan error, 1)
 	qc.qmp <- &QmpSession{
 		commands: commands,
 		respond:  func(err error) { result <- err },
 	}
+	return <-result
 }
 
-func (qc *QemuContext) Save(ctx *hypervisor.VmContext, path string, result chan<- error) {
+func (qc *QemuContext) Save(ctx *hypervisor.VmContext, path string) error {
 	commands := make([]*QmpCommand, 2)
 
 	commands[0] = &QmpCommand{
@@ -328,13 +379,20 @@ func (qc *QemuContext) Save(ctx *hypervisor.VmContext, path string, result chan<
 		commands = commands[1:]
 	}
 
+	result := make(chan error, 1)
 	// TODO: use query-migrate to query until completed
 	qc.qmp <- &QmpSession{
 		commands: commands,
 		respond:  func(err error) { result <- err },
 	}
+
+	return <-result
 }
 
 func (qc *QemuDriver) SupportLazyMode() bool {
 	return false
+}
+
+func (qc *QemuDriver) SupportVmSocket() bool {
+	return qc.hasVsock
 }

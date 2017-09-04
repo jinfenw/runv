@@ -33,19 +33,14 @@ func (qc *QemuContext) arguments(ctx *hypervisor.VmContext) []string {
 	}
 
 	var memParams, cpuParams string
-	if boot.HotAddCpuMem {
-		memParams = fmt.Sprintf("size=%d,slots=1,maxmem=%dM", boot.Memory, hypervisor.DefaultMaxMem) // TODO set maxmem to the total memory of the system
-		cpuParams = fmt.Sprintf("cpus=%d,maxcpus=%d", boot.CPU, hypervisor.DefaultMaxCpus)           // TODO set it to the cpus of the system
-	} else {
-		memParams = strconv.Itoa(boot.Memory)
-		cpuParams = strconv.Itoa(boot.CPU)
-	}
+	memParams = strconv.Itoa(boot.Memory)
+	cpuParams = strconv.Itoa(boot.CPU)
 
 	return []string{
 		"-machine", "pseries,accel=kvm,usb=off", "-global", "kvm-pit.lost_tick_policy=discard", "-cpu", "host",
 		"-kernel", boot.Kernel, "-initrd", boot.Initrd,
 		"-realtime", "mlock=off", "-no-user-config", "-nodefaults",
-		"-rtc", "base=utc,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
+		"-rtc", "base=utc,clock=vm,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
 		"-m", memParams, "-smp", cpuParams,
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", qc.qmpSockName), "-serial", fmt.Sprintf("unix:%s,server,nowait", ctx.ConsoleSockName),
 		"-device", "virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x2", "-device", "virtio-scsi-pci,id=scsi0,bus=pci.0,addr=0x3",

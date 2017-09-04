@@ -23,7 +23,8 @@ var LibvirtdAddress = "qemu:///system"
 
 type LibvirtDriver struct {
 	sync.Mutex
-	conn libvirtgo.VirConnection
+	conn     libvirtgo.VirConnection
+	hasVsock bool
 }
 
 type LibvirtContext struct {
@@ -40,8 +41,15 @@ func InitDriver() *LibvirtDriver {
 		return nil
 	}
 
+	var hasVsock bool
+	_, err = exec.Command("/sbin/modprobe", "vhost_vsock").Output()
+	if err == nil {
+		hasVsock = true
+	}
+
 	return &LibvirtDriver{
-		conn: conn,
+		conn:     conn,
+		hasVsock: hasVsock,
 	}
 }
 
@@ -78,6 +86,10 @@ func (ld *LibvirtDriver) LoadContext(persisted map[string]interface{}) (hypervis
 
 func (ld *LibvirtDriver) SupportLazyMode() bool {
 	return false
+}
+
+func (ld *LibvirtDriver) SupportVmSocket() bool {
+	return ld.hasVsock
 }
 
 func (ld *LibvirtDriver) checkConnection() error {
@@ -356,21 +368,53 @@ type seclab struct {
 	Type string `xml:"type,attr"`
 }
 
+type qemucmd struct {
+	Value string `xml:"value,attr"`
+}
+
+type clock struct {
+	Offset string  `xml:"offset,attr"`
+	Timer  []timer `xml:"timer,omitempty"`
+}
+
+type timer struct {
+	Name       string  `xml:"name,attr"`
+	Track      string  `xml:"track,attr,omitempty"`
+	Tickpolicy string  `xml:"tickpolicy,attr,omitempty"`
+	CatchUp    catchup `xml:"catchup,omitempty"`
+	Frequency  uint32  `xml:"frequency,attr,omitempty"`
+	Mode       string  `xml:"mode,attr,omitempty"`
+	Present    string  `xml:"present,attr,omitempty"`
+}
+
+type catchup struct {
+	Threshold uint `xml:"threshold,attr,omitempty"`
+	Slew      uint `xml:"slew,attr,omitempty"`
+	Limit     uint `xml:"limit,attr,omitempty"`
+}
+
+type commandlines struct {
+	Cmds []qemucmd `xml:"qemu:arg"`
+}
+
 type domain struct {
-	XMLName    xml.Name `xml:"domain"`
-	Type       string   `xml:"type,attr"`
-	Name       string   `xml:"name"`
-	Memory     memory   `xml:"memory"`
-	MaxMem     *maxmem  `xml:"maxMemory,omitempty"`
-	VCpu       vcpu     `xml:"vcpu"`
-	OS         domainos `xml:"os"`
-	Features   features `xml:"features"`
-	CPU        cpu      `xml:"cpu"`
-	OnPowerOff string   `xml:"on_poweroff"`
-	OnReboot   string   `xml:"on_reboot"`
-	OnCrash    string   `xml:"on_crash"`
-	Devices    device   `xml:"devices"`
-	SecLabel   seclab   `xml:"seclabel"`
+	XMLName     xml.Name     `xml:"domain"`
+	Type        string       `xml:"type,attr"`
+	XmlnsQemu   string       `xml:"xmlns:qemu,attr,omitempty"`
+	Name        string       `xml:"name"`
+	Memory      memory       `xml:"memory"`
+	MaxMem      *maxmem      `xml:"maxMemory,omitempty"`
+	VCpu        vcpu         `xml:"vcpu"`
+	OS          domainos     `xml:"os"`
+	Features    features     `xml:"features"`
+	CPU         cpu          `xml:"cpu"`
+	OnPowerOff  string       `xml:"on_poweroff"`
+	OnReboot    string       `xml:"on_reboot"`
+	OnCrash     string       `xml:"on_crash"`
+	Devices     device       `xml:"devices"`
+	SecLabel    seclab       `xml:"seclabel"`
+	Clock       clock        `xml:"clock"`
+	CommandLine commandlines `xml:"qemu:commandline"`
 }
 
 func (lc *LibvirtContext) domainXml(ctx *hypervisor.VmContext) (string, error) {
@@ -398,12 +442,13 @@ func (lc *LibvirtContext) domainXml(ctx *hypervisor.VmContext) (string, error) {
 
 	dom.OS.Supported = "yes"
 	dom.OS.Type.Arch = "x86_64"
-	dom.OS.Type.Machine = "pc-i440fx-2.0"
+	dom.OS.Type.Machine = "pc-i440fx-2.1"
 	dom.OS.Type.Content = "hvm"
 
 	dom.SecLabel.Type = "none"
 
 	dom.CPU.Mode = "host-passthrough"
+	cmdline := "console=ttyS0 panic=1 no_timer_check"
 	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
 		dom.Type = "qemu"
 		dom.CPU.Mode = "host-model"
@@ -412,20 +457,26 @@ func (lc *LibvirtContext) domainXml(ctx *hypervisor.VmContext) (string, error) {
 			Fallback: "allow",
 			Content:  "core2duo",
 		}
+		cmdline += " clocksource=acpi_pm notsc"
 	}
 
-	if ctx.Boot.HotAddCpuMem {
-		dom.OS.Type.Machine = "pc-i440fx-2.1"
-		dom.VCpu.Content = hypervisor.DefaultMaxCpus
-		dom.MaxMem = &maxmem{Unit: "MiB", Slots: "1", Content: hypervisor.DefaultMaxMem}
+	dom.VCpu.Content = hypervisor.DefaultMaxCpus
+	dom.MaxMem = &maxmem{Unit: "MiB", Slots: "1", Content: hypervisor.DefaultMaxMem}
 
-		cells := make([]cell, 1)
-		cells[0].Id = "0"
-		cells[0].Cpus = fmt.Sprintf("0-%d", hypervisor.DefaultMaxCpus-1)
-		cells[0].Memory = strconv.Itoa(ctx.Boot.Memory * 1024) // older libvirt always considers unit='KiB'
-		cells[0].Unit = "KiB"
+	cells := make([]cell, 1)
+	cells[0].Id = "0"
+	cells[0].Cpus = fmt.Sprintf("0-%d", hypervisor.DefaultMaxCpus-1)
+	cells[0].Memory = strconv.Itoa(ctx.Boot.Memory * 1024) // older libvirt always considers unit='KiB'
+	cells[0].Unit = "KiB"
 
-		dom.CPU.Numa = &numa{Cell: cells}
+	dom.CPU.Numa = &numa{Cell: cells}
+
+	if ctx.Boot.EnableVsock {
+		dom.XmlnsQemu = "http://libvirt.org/schemas/domain/qemu/1.0"
+		dom.CommandLine.Cmds = append(dom.CommandLine.Cmds, qemucmd{Value: "-device"})
+		vsockDev := fmt.Sprintf("vhost-vsock-pci,id=vsock0,bus=pci.0,addr=%x,guest-cid=%d", ctx.NextPciAddr(), ctx.GuestCid)
+		dom.CommandLine.Cmds = append(dom.CommandLine.Cmds, qemucmd{Value: vsockDev})
+		glog.Infof("vsock cmds xml: %v", dom.CommandLine)
 	}
 
 	cmd, err := exec.LookPath("qemu-system-x86_64")
@@ -449,6 +500,9 @@ func (lc *LibvirtContext) domainXml(ctx *hypervisor.VmContext) (string, error) {
 	dom.OnPowerOff = "destroy"
 	dom.OnReboot = "destroy"
 	dom.OnCrash = "destroy"
+
+	dom.Clock.Offset = "utc"
+	dom.Clock.Timer = append(dom.Clock.Timer, timer{Name: "rtc", Track: "guest", Tickpolicy: "catchup"})
 
 	pcicontroller := controller{
 		Type:  "pci",
@@ -571,7 +625,7 @@ func (lc *LibvirtContext) domainXml(ctx *hypervisor.VmContext) (string, error) {
 	} else {
 		dom.OS.Kernel = boot.Kernel
 		dom.OS.Initrd = boot.Initrd
-		dom.OS.Cmdline = "console=ttyS0 panic=1 no_timer_check"
+		dom.OS.Cmdline = cmdline
 	}
 
 	data, err := xml.Marshal(dom)
@@ -659,17 +713,15 @@ func (lc *LibvirtContext) Close() {
 	lc.domain = nil
 }
 
-func (lc *LibvirtContext) Pause(ctx *hypervisor.VmContext, pause bool, result chan<- error) {
+func (lc *LibvirtContext) Pause(ctx *hypervisor.VmContext, pause bool) error {
 	if lc.domain == nil {
-		result <- fmt.Errorf("Cannot find domain")
-		return
+		return fmt.Errorf("Cannot find domain")
 	}
 
 	if pause {
-		result <- lc.domain.Suspend()
-	} else {
-		result <- lc.domain.Resume()
+		return lc.domain.Suspend()
 	}
+	return lc.domain.Resume()
 }
 
 type diskdriver struct {
@@ -711,18 +763,19 @@ type iotune struct {
 }
 
 type disk struct {
-	XMLName xml.Name    `xml:"disk"`
-	Type    string      `xml:"type,attr"`
-	Device  string      `xml:"device,attr"`
-	Driver  *diskdriver `xml:"driver,omitempty"`
-	Source  disksrc     `xml:"source"`
-	Target  disktgt     `xml:"target"`
-	Address *address    `xml:"address"`
-	Auth    *cephauth   `xml:"auth,omitempty"`
-	Iotune  iotune      `xml:"iotune,omitempty"`
+	XMLName  xml.Name    `xml:"disk"`
+	Type     string      `xml:"type,attr"`
+	Device   string      `xml:"device,attr"`
+	Driver   *diskdriver `xml:"driver,omitempty"`
+	Source   disksrc     `xml:"source"`
+	Target   disktgt     `xml:"target"`
+	Address  *address    `xml:"address"`
+	Auth     *cephauth   `xml:"auth,omitempty"`
+	ReadOnly string      `xml:"readonly,omitempty"`
+	Iotune   iotune      `xml:"iotune,omitempty"`
 }
 
-func diskXml(blockInfo *hypervisor.BlockDescriptor, secretUUID string) (string, error) {
+func diskXml(blockInfo *hypervisor.DiskDescriptor, secretUUID string) (string, error) {
 	filename := blockInfo.Filename
 	format := blockInfo.Format
 	id := blockInfo.ScsiId
@@ -746,6 +799,10 @@ func diskXml(blockInfo *hypervisor.BlockDescriptor, secretUUID string) (string, 
 			Target:     target,
 			Unit:       unit,
 		},
+	}
+
+	if blockInfo.ReadOnly {
+		d.ReadOnly = "yes"
 	}
 
 	if strings.HasPrefix(filename, "rbd:") {
@@ -806,7 +863,7 @@ func diskXml(blockInfo *hypervisor.BlockDescriptor, secretUUID string) (string, 
 	return string(data), nil
 }
 
-func (lc *LibvirtContext) diskSecretUUID(blockInfo *hypervisor.BlockDescriptor) (res string, err error) {
+func (lc *LibvirtContext) diskSecretUUID(blockInfo *hypervisor.DiskDescriptor) (res string, err error) {
 	var sec libvirtgo.VirSecret
 
 	filename := blockInfo.Filename
@@ -851,13 +908,10 @@ func scsiId2Addr(id int) (int, int, error) {
 	return id / 256, id % 256, nil
 }
 
-func (lc *LibvirtContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.BlockDescriptor) {
-	name := blockInfo.Name
-	id := blockInfo.ScsiId
-
+func (lc *LibvirtContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.DiskDescriptor, result chan<- hypervisor.VmEvent) {
 	if lc.domain == nil {
 		glog.Error("Cannot find domain")
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -866,7 +920,7 @@ func (lc *LibvirtContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, 
 	secretUUID, err := lc.diskSecretUUID(blockInfo)
 	if err != nil {
 		glog.Error("generate disk-get-secret failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -875,7 +929,7 @@ func (lc *LibvirtContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, 
 	diskXml, err := diskXml(blockInfo, secretUUID)
 	if err != nil {
 		glog.Error("generate attach-disk-xml failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -885,25 +939,22 @@ func (lc *LibvirtContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, 
 	err = lc.domain.AttachDeviceFlags(diskXml, libvirtgo.VIR_DOMAIN_DEVICE_MODIFY_LIVE)
 	if err != nil {
 		glog.Error("attach disk device failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
 	}
-	target, unit, err := scsiId2Addr(id)
-	ctx.Hub <- &hypervisor.BlockdevInsertedEvent{
-		Name:       name,
-		SourceType: sourceType,
-		DeviceName: scsiId2Name(id),
-		ScsiId:     id,
+	target, unit, err := scsiId2Addr(blockInfo.ScsiId)
+	result <- &hypervisor.BlockdevInsertedEvent{
+		DeviceName: scsiId2Name(blockInfo.ScsiId),
 		ScsiAddr:   fmt.Sprintf("%d:%d", target, unit),
 	}
 }
 
-func (lc *LibvirtContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.BlockDescriptor, callback hypervisor.VmEvent) {
+func (lc *LibvirtContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.DiskDescriptor, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	if lc.domain == nil {
 		glog.Error("Cannot find domain")
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -912,7 +963,7 @@ func (lc *LibvirtContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hyper
 	secretUUID, err := lc.diskSecretUUID(blockInfo)
 	if err != nil {
 		glog.Error("generate disk-get-secret failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -921,7 +972,7 @@ func (lc *LibvirtContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hyper
 	diskXml, err := diskXml(blockInfo, secretUUID)
 	if err != nil {
 		glog.Error("generate detach-disk-xml failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: callback,
 		}
 		return
@@ -929,12 +980,12 @@ func (lc *LibvirtContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hyper
 	err = lc.domain.DetachDeviceFlags(diskXml, libvirtgo.VIR_DOMAIN_DEVICE_MODIFY_LIVE)
 	if err != nil {
 		glog.Error("detach disk device failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: callback,
 		}
 		return
 	}
-	ctx.Hub <- callback
+	result <- callback
 }
 
 type nicmac struct {
@@ -1047,16 +1098,17 @@ func (lc *LibvirtContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.Hos
 	}
 
 	result <- &hypervisor.NetDevInsertedEvent{
+		Id:         host.Id,
 		Index:      guest.Index,
 		DeviceName: guest.Device,
 		Address:    guest.Busaddr,
 	}
 }
 
-func (lc *LibvirtContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent) {
+func (lc *LibvirtContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	if lc.domain == nil {
 		glog.Error("Cannot find domain")
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -1065,7 +1117,7 @@ func (lc *LibvirtContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.Int
 	nicXml, err := nicXml(n.Bridge, n.HostDevice, n.MacAddr, n.PCIAddr, ctx.Boot)
 	if err != nil {
 		glog.Error("generate detach-nic-xml failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: callback,
 		}
 		return
@@ -1074,50 +1126,44 @@ func (lc *LibvirtContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.Int
 	err = lc.domain.DetachDeviceFlags(nicXml, libvirtgo.VIR_DOMAIN_DEVICE_MODIFY_LIVE)
 	if err != nil {
 		glog.Error("detach nic failed, ", err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: callback,
 		}
 		return
 	}
-	ctx.Hub <- callback
+	result <- callback
 }
 
-func (lc *LibvirtContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<- error) {
+func (lc *LibvirtContext) SetCpus(ctx *hypervisor.VmContext, cpus int) error {
 	glog.V(3).Infof("setcpus %d", cpus)
 	if lc.domain == nil {
-		result <- fmt.Errorf("Cannot find domain")
-		return
+		return fmt.Errorf("Cannot find domain")
 	}
 
-	err := lc.domain.SetVcpusFlags(uint(cpus), libvirtgo.VIR_DOMAIN_VCPU_LIVE)
-	result <- err
+	return lc.domain.SetVcpusFlags(uint16(cpus), libvirtgo.VIR_DOMAIN_VCPU_LIVE)
 }
 
-func (lc *LibvirtContext) AddMem(ctx *hypervisor.VmContext, slot, size int, result chan<- error) {
+func (lc *LibvirtContext) AddMem(ctx *hypervisor.VmContext, slot, size int) error {
 	memdevXml := fmt.Sprintf("<memory model='dimm'><target><size unit='MiB'>%d</size><node>0</node></target></memory>", size)
 	glog.V(3).Infof("memdevXml: %s", memdevXml)
 	if lc.domain == nil {
-		result <- fmt.Errorf("Cannot find domain")
-		return
+		return fmt.Errorf("Cannot find domain")
 	}
 
-	err := lc.domain.AttachDeviceFlags(memdevXml, libvirtgo.VIR_DOMAIN_DEVICE_MODIFY_LIVE)
-	result <- err
+	return lc.domain.AttachDeviceFlags(memdevXml, libvirtgo.VIR_DOMAIN_DEVICE_MODIFY_LIVE)
 }
 
-func (lc *LibvirtContext) Save(ctx *hypervisor.VmContext, path string, result chan<- error) {
+func (lc *LibvirtContext) Save(ctx *hypervisor.VmContext, path string) error {
 	glog.V(3).Infof("save domain to: %s", path)
 
 	if ctx.Boot.BootToBeTemplate {
 		err := exec.Command("virsh", "-c", LibvirtdAddress, "qemu-monitor-command", ctx.Id, "--hmp", "migrate_set_capability bypass-shared-memory on").Run()
 		if err != nil {
-			result <- err
-			return
+			return err
 		}
 	}
 
 	// lc.domain.Save(path) will have libvirt header and will destroy the vm
 	// TODO: use virsh qemu-monitor-event to query until completed
-	err := exec.Command("virsh", "-c", LibvirtdAddress, "qemu-monitor-command", ctx.Id, "--hmp", fmt.Sprintf("migrate exec:cat>%s", path)).Run()
-	result <- err
+	return exec.Command("virsh", "-c", LibvirtdAddress, "qemu-monitor-command", ctx.Id, "--hmp", fmt.Sprintf("migrate exec:cat>%s", path)).Run()
 }

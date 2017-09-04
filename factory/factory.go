@@ -6,6 +6,8 @@ package factory
 
 import (
 	"encoding/json"
+	"path/filepath"
+
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/factory/base"
 	"github.com/hyperhq/runv/factory/cache"
@@ -28,21 +30,23 @@ type FactoryConfig struct {
 	Memory   int  `json:"memory"`
 }
 
-func NewFromConfigs(kernel, initrd string, configs []FactoryConfig) Factory {
+func NewFromConfigs(bootConfig hypervisor.BootConfig, configs []FactoryConfig) Factory {
 	bases := make([]base.Factory, len(configs))
 	for i, c := range configs {
 		var b base.Factory
+		boot := bootConfig
+		boot.CPU = c.Cpu
+		boot.Memory = c.Memory
 		if c.Template {
-			b = template.New(hypervisor.BaseDir+"/template", c.Cpu, c.Memory, kernel, initrd)
+			b = template.New(filepath.Join(hypervisor.BaseDir, "template"), boot)
 		} else {
-			b = direct.New(c.Cpu, c.Memory, kernel, initrd)
+			b = direct.New(boot)
 		}
 		bases[i] = cache.New(c.Cache, b)
 	}
 
 	if len(bases) == 0 {
-		// skip GetVm from the base factory
-		return single.New(direct.New(1000000, 1000000, kernel, initrd))
+		return single.Dummy(bootConfig)
 	} else if len(bases) == 1 {
 		return single.New(bases[0])
 	} else {
@@ -52,12 +56,12 @@ func NewFromConfigs(kernel, initrd string, configs []FactoryConfig) Factory {
 
 // vmFactoryPolicy = [FactoryConfig,]*FactoryConfig
 // FactoryConfig   = {["cache":NUMBER,]["template":true|false,]"cpu":NUMBER,"memory":NUMBER}
-func NewFromPolicy(kernel, initrd string, policy string) Factory {
+func NewFromPolicy(bootConfig hypervisor.BootConfig, policy string) Factory {
 	var configs []FactoryConfig
 	jsonString := "[" + policy + "]"
 	err := json.Unmarshal([]byte(jsonString), &configs)
 	if err != nil && policy != "none" {
 		glog.Errorf("Incorrect policy: %s", policy)
 	}
-	return NewFromConfigs(kernel, initrd, configs)
+	return NewFromConfigs(bootConfig, configs)
 }

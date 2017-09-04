@@ -10,14 +10,7 @@ type directFactory struct {
 	config hypervisor.BootConfig
 }
 
-func New(cpu, mem int, kernel, initrd string) base.Factory {
-	b := hypervisor.BootConfig{
-		CPU:          cpu,
-		Memory:       mem,
-		HotAddCpuMem: true,
-		Kernel:       kernel,
-		Initrd:       initrd,
-	}
+func New(b hypervisor.BootConfig) base.Factory {
 	return &directFactory{config: b}
 }
 
@@ -27,8 +20,8 @@ func (d *directFactory) Config() *hypervisor.BootConfig {
 }
 
 func (d *directFactory) GetBaseVm() (*hypervisor.Vm, error) {
-	glog.V(2).Infof("direct factory start create vm")
-	vm, err := hypervisor.GetVm("", d.Config(), true, false)
+	glog.V(3).Infof("direct factory start create vm")
+	vm, err := hypervisor.GetVm("", d.Config(), true)
 	if err == nil {
 		err = vm.Pause(true)
 		if err != nil {
@@ -37,10 +30,9 @@ func (d *directFactory) GetBaseVm() (*hypervisor.Vm, error) {
 		}
 	}
 	if err == nil {
-		glog.V(2).Infof("direct factory created vm:%s", vm.Id)
+		glog.V(3).Infof("direct factory created vm: %s", vm.Id)
 	} else {
-		glog.V(2).Infof("direct factory failed to create vm")
-
+		glog.Errorf("direct factory failed to create vm")
 	}
 	return vm, err
 }

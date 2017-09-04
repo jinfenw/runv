@@ -5,7 +5,6 @@ package qemu
 import (
 	"fmt"
 	"os"
-	"strconv"
 
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/hypervisor"
@@ -28,21 +27,17 @@ func (qc *QemuContext) arguments(ctx *hypervisor.VmContext) []string {
 	qc.cpus = boot.CPU
 
 	var machineClass, memParams, cpuParams string
-	if boot.HotAddCpuMem || boot.BootToBeTemplate || boot.BootFromTemplate {
-		machineClass = "pc-i440fx-2.1"
-		memParams = fmt.Sprintf("size=%d,slots=1,maxmem=%dM", boot.Memory, hypervisor.DefaultMaxMem) // TODO set maxmem to the total memory of the system
-		cpuParams = fmt.Sprintf("cpus=%d,maxcpus=%d", boot.CPU, hypervisor.DefaultMaxCpus)           // TODO set it to the cpus of the system
-	} else {
-		machineClass = "pc-i440fx-2.0"
-		memParams = strconv.Itoa(boot.Memory)
-		cpuParams = strconv.Itoa(boot.CPU)
-	}
+	machineClass = "pc-i440fx-2.1"
+	memParams = fmt.Sprintf("size=%d,slots=1,maxmem=%dM", boot.Memory, hypervisor.DefaultMaxMem) // TODO set maxmem to the total memory of the system
+	cpuParams = fmt.Sprintf("cpus=%d,maxcpus=%d", boot.CPU, hypervisor.DefaultMaxCpus)           // TODO set it to the cpus of the system
 
+	cmdline := "console=ttyS0 panic=1 no_timer_check"
 	params := []string{
 		"-machine", machineClass + ",accel=kvm,usb=off", "-global", "kvm-pit.lost_tick_policy=discard", "-cpu", "host"}
 	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
 		glog.V(1).Info("kvm not exist change to no kvm mode")
 		params = []string{"-machine", machineClass + ",usb=off", "-cpu", "core2duo"}
+		cmdline += " clocksource=acpi_pm notsc"
 	}
 
 	if boot.Bios != "" && boot.Cbfs != "" {
@@ -52,21 +47,26 @@ func (qc *QemuContext) arguments(ctx *hypervisor.VmContext) []string {
 	} else if boot.Bios != "" {
 		params = append(params,
 			"-bios", boot.Bios,
-			"-kernel", boot.Kernel, "-initrd", boot.Initrd, "-append", "console=ttyS0 panic=1 no_timer_check")
+			"-kernel", boot.Kernel, "-initrd", boot.Initrd, "-append", cmdline)
 	} else if boot.Cbfs != "" {
 		params = append(params,
 			"-drive", fmt.Sprintf("if=pflash,file=%s,readonly=on", boot.Cbfs))
 	} else {
 		params = append(params,
-			"-kernel", boot.Kernel, "-initrd", boot.Initrd, "-append", "console=ttyS0 panic=1 no_timer_check")
+			"-kernel", boot.Kernel, "-initrd", boot.Initrd, "-append", cmdline)
 	}
 
 	params = append(params,
 		"-realtime", "mlock=off", "-no-user-config", "-nodefaults", "-no-hpet",
-		"-rtc", "base=utc,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
+		"-rtc", "base=utc,clock=vm,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
 		"-m", memParams, "-smp", cpuParams)
-
-	if boot.BootToBeTemplate || boot.BootFromTemplate {
+	if boot.EnableVhostUser {
+		//TODO: mount hugetlbfs on /dev/hugepages
+		boot.MemoryPath = "/dev/hugepages"
+		memObject := fmt.Sprintf("memory-backend-file,id=hyper-memory,size=%dM,mem-path=%s,share=on", boot.Memory, boot.MemoryPath)
+		nodeConfig := fmt.Sprintf("node,nodeid=0,cpus=0-%d,memdev=hyper-memory", hypervisor.DefaultMaxCpus-1)
+		params = append(params, "-object", memObject, "-numa", nodeConfig)
+	} else if boot.BootToBeTemplate || boot.BootFromTemplate {
 		memObject := fmt.Sprintf("memory-backend-file,id=hyper-template-memory,size=%dM,mem-path=%s", boot.Memory, boot.MemoryPath)
 		if boot.BootToBeTemplate {
 			memObject = memObject + ",share=on"
@@ -76,7 +76,7 @@ func (qc *QemuContext) arguments(ctx *hypervisor.VmContext) []string {
 		if boot.BootFromTemplate {
 			params = append(params, "-S", "-incoming", fmt.Sprintf("exec:cat %s", boot.DevicesStatePath))
 		}
-	} else if boot.HotAddCpuMem {
+	} else {
 		nodeConfig := fmt.Sprintf("node,nodeid=0,cpus=0-%d,mem=%d", hypervisor.DefaultMaxCpus-1, boot.Memory)
 		params = append(params, "-numa", nodeConfig)
 	}

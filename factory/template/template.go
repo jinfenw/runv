@@ -3,12 +3,13 @@ package template
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/golang/glog"
 	"github.com/hyperhq/runv/factory/base"
 	"github.com/hyperhq/runv/factory/direct"
 	"github.com/hyperhq/runv/hypervisor"
-	"github.com/hyperhq/runv/hypervisor/pod"
+	"github.com/hyperhq/runv/lib/utils"
 	"github.com/hyperhq/runv/template"
 )
 
@@ -16,20 +17,20 @@ type templateFactory struct {
 	s *template.TemplateVmConfig
 }
 
-func New(templateRoot string, cpu, mem int, kernel, initrd string) base.Factory {
+func New(templateRoot string, b hypervisor.BootConfig) base.Factory {
 	var vmName string
 
 	for {
-		vmName = fmt.Sprintf("template-vm-%s", pod.RandStr(10, "alpha"))
-		if _, err := os.Stat(templateRoot + "/" + vmName); os.IsNotExist(err) {
+		vmName = fmt.Sprintf("template-vm-%s", utils.RandStr(10, "alpha"))
+		if _, err := os.Stat(filepath.Join(templateRoot, vmName)); os.IsNotExist(err) {
 			break
 		}
 	}
-	s, err := template.CreateTemplateVM(templateRoot+"/"+vmName, vmName, cpu, mem, kernel, initrd)
+	s, err := template.CreateTemplateVM(filepath.Join(templateRoot, vmName), vmName, b)
 	if err != nil {
-		glog.Infof("failed to create template factory: %v", err)
-		glog.Infof("use direct factory instead")
-		return direct.New(cpu, mem, kernel, initrd)
+		glog.Errorf("failed to create template factory: %v", err)
+		glog.V(3).Infof("use direct factory instead")
+		return direct.New(b)
 	}
 	return &templateFactory{s: s}
 }

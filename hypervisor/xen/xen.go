@@ -186,10 +186,10 @@ func (xc *XenContext) Dump() (map[string]interface{}, error) {
 	}, nil
 }
 
-func (xc *XenContext) Pause(ctx *hypervisor.VmContext, pause bool, result chan<- error) {
+func (xc *XenContext) Pause(ctx *hypervisor.VmContext, pause bool) error {
 	err := fmt.Errorf("doesn't support pause for xen right now")
 	glog.Warning(err)
-	result <- err
+	return err
 }
 
 func (xc *XenContext) Shutdown(ctx *hypervisor.VmContext) {
@@ -217,26 +217,26 @@ func (xc *XenContext) Stats(ctx *hypervisor.VmContext) (*types.PodStats, error) 
 
 func (xc *XenContext) Close() {}
 
-func (xc *XenContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.BlockDescriptor) {
-	name := blockInfo.Name
+func (xc *XenContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.DiskDescriptor, result chan<- hypervisor.VmEvent) {
 	filename := blockInfo.Filename
 	format := blockInfo.Format
 	id := blockInfo.ScsiId
 
-	go diskRoutine(true, xc, ctx, name, sourceType, filename, format, id, nil)
+	go diskRoutine(true, xc, ctx, sourceType, filename, format, id, nil, result)
 }
 
-func (xc *XenContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.BlockDescriptor, callback hypervisor.VmEvent) {
+func (xc *XenContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.DiskDescriptor, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	filename := blockInfo.Filename
 	format := blockInfo.Format
 	id := blockInfo.ScsiId
 
-	go diskRoutine(false, xc, ctx, "", "", filename, format, id, callback)
+	go diskRoutine(false, xc, ctx, "", filename, format, id, callback, result)
 }
 
 func (xc *XenContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNicInfo, guest *hypervisor.GuestNicInfo, result chan<- hypervisor.VmEvent) {
 	go func() {
 		callback := &hypervisor.NetDevInsertedEvent{
+			Id:         host.Id,
 			Index:      guest.Index,
 			DeviceName: guest.Device,
 			Address:    guest.Busaddr,
@@ -255,7 +255,7 @@ func (xc *XenContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNic
 
 				glog.V(1).Infof("nic %s insert succeeded", guest.Device)
 
-				err = network.UpAndAddToBridge(fmt.Sprintf("vif%d.%d", xc.domId, guest.Index))
+				err = network.UpAndAddToBridge(fmt.Sprintf("vif%d.%d", xc.domId, guest.Index), "", "")
 				if err != nil {
 					glog.Error("fail to add vif to bridge: ", err.Error())
 					ctx.Hub <- &hypervisor.DeviceFailed{
@@ -280,16 +280,16 @@ func (xc *XenContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNic
 	}()
 }
 
-func (xc *XenContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent) {
+func (xc *XenContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	go func() {
 		res := HyperxlNicRemove(xc.driver.Ctx, (uint32)(xc.domId), n.MacAddr)
 		if res == 0 {
 			glog.V(1).Infof("nic %s remove succeeded", n.DeviceName)
-			ctx.Hub <- callback
+			result <- callback
 			return
 		}
 		glog.Errorf("nic %s remove failed", n.DeviceName)
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: callback,
 		}
 	}()
@@ -299,8 +299,12 @@ func (xd *XenDriver) SupportLazyMode() bool {
 	return false
 }
 
+func (xd *XenDriver) SupportVmSocket() bool {
+	return false
+}
+
 func diskRoutine(add bool, xc *XenContext, ctx *hypervisor.VmContext,
-	name, sourceType, filename, format string, id int, callback hypervisor.VmEvent) {
+	sourceType, filename, format string, id int, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	backend := LIBXL_DISK_BACKEND_TAP
 	if strings.HasPrefix(filename, "/dev/") {
 		backend = LIBXL_DISK_BACKEND_PHY
@@ -316,10 +320,7 @@ func diskRoutine(add bool, xc *XenContext, ctx *hypervisor.VmContext,
 	if add {
 		res = HyperxlDiskAdd(xc.driver.Ctx, uint32(xc.domId), filename, devName, LibxlDiskBackend(backend), LibxlDiskFormat(dfmt))
 		callback = &hypervisor.BlockdevInsertedEvent{
-			Name:       name,
-			SourceType: sourceType,
 			DeviceName: devName,
-			ScsiId:     id,
 		}
 	} else {
 		op = "remove"
@@ -327,26 +328,26 @@ func diskRoutine(add bool, xc *XenContext, ctx *hypervisor.VmContext,
 	}
 	if res == 0 {
 		glog.V(1).Infof("Disk %s (%s) %s succeeded", devName, filename, op)
-		ctx.Hub <- callback
+		result <- callback
 		return
 	}
 
 	glog.Errorf("Disk %s (%s) insert %s failed", devName, filename, op)
-	ctx.Hub <- &hypervisor.DeviceFailed{
+	result <- &hypervisor.DeviceFailed{
 		Session: callback,
 	}
 }
 
-func (xc *XenContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<- error) {
-	result <- fmt.Errorf("SetCpus is unsupported on xen driver")
+func (xc *XenContext) SetCpus(ctx *hypervisor.VmContext, cpus int) error {
+	return fmt.Errorf("SetCpus is unsupported on xen driver")
 }
 
-func (xc *XenContext) AddMem(ctx *hypervisor.VmContext, slot, size int, result chan<- error) {
-	result <- fmt.Errorf("AddMem is unsupported on xen driver")
+func (xc *XenContext) AddMem(ctx *hypervisor.VmContext, slot, size int) error {
+	return fmt.Errorf("AddMem is unsupported on xen driver")
 }
 
-func (xc *XenContext) Save(ctx *hypervisor.VmContext, path string, result chan<- error) {
-	result <- fmt.Errorf("Save is unsupported on xen driver")
+func (xc *XenContext) Save(ctx *hypervisor.VmContext, path string) error {
+	return fmt.Errorf("Save is unsupported on xen driver")
 }
 
 func XlStartDomain(ctx LibxlCtxPtr, id string, boot *hypervisor.BootConfig, hyperSock, ttySock, consoleSock string, extra []string) (int, unsafe.Pointer, error) {

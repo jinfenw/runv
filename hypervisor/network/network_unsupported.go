@@ -2,19 +2,25 @@
 
 package network
 
+import (
+	"fmt"
+	"os"
+
+	"github.com/hyperhq/runv/api"
+)
+
 func InitNetwork(bIface, bIP string, disableIptables bool) error {
 	return nil
 }
 
-func Allocate(vmId, requestedIP string, addrOnly bool, maps []pod.UserContainerPort) (*Settings, error) {
-	return nil, nil
-}
-
-func Configure(vmId, requestedIP string, addrOnly bool,
-	maps []pod.UserContainerPort, config pod.UserInterface) (*Settings, error) {
+func AllocateAddr(requestedIP string) (*Settings, error) {
 	return nil, fmt.Errorf("Generial Network driver is unsupported on this os")
 }
 
-func Release(vmId, releasedIP string, maps []pod.UserContainerPort, file *os.File) error {
+func Configure(addrOnly bool, vInfo *VhostUserInfo, inf *api.InterfaceDescription) (*Settings, error) {
+	return nil, fmt.Errorf("Generial Network driver is unsupported on this os")
+}
+
+func ReleaseAddr(releasedIP string) error {
 	return nil
 }

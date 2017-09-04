@@ -1,3 +1,5 @@
+// +build linux
+
 package qemu
 
 import (
@@ -67,7 +69,7 @@ func (f *QemuLogFile) Watch() {
 			break
 		}
 		if err != nil {
-			glog.Errorf("read log file %s failed: %v", f.Name, err)
+			glog.Infof("read log file %s failed: %v", f.Name, err)
 			return
 		}
 		if len(log) != 0 {
@@ -126,9 +128,14 @@ func launchQemu(qc *QemuContext, ctx *hypervisor.VmContext) {
 
 	args := qc.arguments(ctx)
 	args = append(args, "-daemonize", "-pidfile", qc.qemuPidFile, "-D", qc.qemuLogFile.Name)
+	if ctx.Boot.EnableVsock && qc.driver.hasVsock && ctx.GuestCid > 0 {
+		addr := ctx.NextPciAddr()
+		vsockDev := fmt.Sprintf("vhost-vsock-pci,id=vsock0,bus=pci.0,addr=%x,guest-cid=%d", addr, ctx.GuestCid)
+		args = append(args, "-device", vsockDev)
+	}
 
-	if glog.V(1) {
-		glog.Info("cmdline arguments: ", strings.Join(args, " "))
+	if glog.V(3) {
+		glog.Infof("cmdline arguments: %s", strings.Join(args, " "))
 		glog.Infof("qemu log file: %s", qc.qemuLogFile.Name)
 	}
 
@@ -142,7 +149,7 @@ func launchQemu(qc *QemuContext, ctx *hypervisor.VmContext) {
 	err := cmd.Run()
 
 	if stdout.Len() != 0 {
-		glog.Info(stdout.String())
+		glog.V(1).Info(stdout.String())
 	}
 	if stderr.Len() != 0 {
 		glog.Error(stderr.String())
@@ -203,7 +210,7 @@ func launchQemu(qc *QemuContext, ctx *hypervisor.VmContext) {
 
 	file.Close()
 
-	glog.V(1).Infof("starting daemon with pid: %d", pid)
+	glog.V(3).Infof("starting daemon with pid: %d", pid)
 
 	go qc.qemuLogFile.Watch()
 

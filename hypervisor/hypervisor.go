@@ -1,116 +1,144 @@
 package hypervisor
 
 import (
-	"github.com/golang/glog"
+	"fmt"
+	"time"
+
+	"github.com/hyperhq/hypercontainer-utils/hlog"
+	"github.com/hyperhq/runv/hyperstart/libhyperstart"
 	"github.com/hyperhq/runv/hypervisor/network"
 	"github.com/hyperhq/runv/hypervisor/types"
-
-	"sync"
 )
-
-func (ctx *VmContext) startSocks() {
-	go waitInitReady(ctx)
-	go waitPts(ctx)
-	if glog.V(1) {
-		go waitConsoleOutput(ctx)
-	}
-}
 
 func (ctx *VmContext) loop() {
 	for ctx.handler != nil {
 		ev, ok := <-ctx.Hub
 		if !ok {
-			glog.Error("hub chan has already been closed")
+			ctx.Log(ERROR, "hub chan has already been closed")
 			break
 		} else if ev == nil {
-			glog.V(1).Info("got nil event.")
+			ctx.Log(DEBUG, "got nil event.")
 			continue
 		}
-		glog.V(1).Infof("vm %s: main event loop got message %d(%s)", ctx.Id, ev.Event(), EventString(ev.Event()))
+		ctx.Log(TRACE, "main event loop got message %d(%s)", ev.Event(), EventString(ev.Event()))
 		ctx.handler(ctx, ev)
 	}
+
+	// Unless the ctx.Hub channel is drained, processes sending operations can
+	// be left hanging waiting for a response. Since the handler is already
+	// gone, we return a fail to all these requests.
+
+	ctx.Log(DEBUG, "main event loop exiting")
 }
 
-func VmLoop(vmId string, hub chan VmEvent, client chan *types.VmResponse, boot *BootConfig) {
-	context, err := InitContext(vmId, hub, client, nil, boot)
-	if err != nil {
-		client <- &types.VmResponse{
-			VmId:  vmId,
-			Code:  types.E_BAD_REQUEST,
-			Cause: err.Error(),
+func (ctx *VmContext) watchHyperstart() {
+	next := time.NewTimer(10 * time.Second)
+	timeout := time.AfterFunc(60*time.Second, func() {
+		ctx.Log(ERROR, "watch hyperstart timeout")
+		ctx.Hub <- &InitFailedEvent{Reason: "watch hyperstart timeout"}
+		ctx.hyperstart.Close()
+	})
+	ctx.Log(DEBUG, "watch hyperstart")
+loop:
+	for {
+		ctx.Log(TRACE, "issue VERSION request for keep-alive test")
+		_, err := ctx.hyperstart.APIVersion()
+		if err != nil {
+			ctx.Log(WARNING, "keep-alive test end with error: %v", err)
+			ctx.hyperstart.Close()
+			ctx.Hub <- &InitFailedEvent{Reason: "hyperstart failed: " + err.Error()}
+			break
 		}
-		return
+		if !timeout.Stop() {
+			<-timeout.C
+		}
+		select {
+		case <-ctx.cancelWatchHyperstart:
+			break loop
+		case <-next.C:
+		}
+		next.Reset(10 * time.Second)
+		timeout.Reset(60 * time.Second)
 	}
+	next.Stop()
+	timeout.Stop()
+}
+
+func (ctx *VmContext) WaitSockConnected() {
+	<-ctx.sockConnected
+}
+
+func (ctx *VmContext) Launch() {
+	var err error
+
+	ctx.DCtx.Launch(ctx)
 
 	//launch routines
-	context.startSocks()
-	context.DCtx.Launch(context)
-
-	context.loop()
+	if ctx.Boot.BootFromTemplate {
+		ctx.Log(TRACE, "boot from template")
+		ctx.PauseState = PauseStatePaused
+		ctx.hyperstart, err = libhyperstart.NewHyperstart(ctx.Id, ctx.ctlSockAddr(), ctx.ttySockAddr(), 1, false, true)
+	} else {
+		ctx.hyperstart, err = libhyperstart.NewHyperstart(ctx.Id, ctx.ctlSockAddr(), ctx.ttySockAddr(), 1, true, false)
+		go ctx.watchHyperstart()
+	}
+	if err != nil {
+		ctx.Log(ERROR, "failed to create hypervisor")
+	}
+	if ctx.LogLevel(DEBUG) {
+		go watchVmConsole(ctx)
+	}
+	close(ctx.sockConnected)
+	go ctx.loop()
 }
 
-func VmAssociate(vmId string, hub chan VmEvent, client chan *types.VmResponse,
-	wg *sync.WaitGroup, pack []byte) {
+func VmAssociate(vmId string, hub chan VmEvent, client chan *types.VmResponse, pack []byte) (*VmContext, error) {
 
-	if glog.V(1) {
-		glog.Infof("VM %s trying to reload with serialized data: %s", vmId, string(pack))
+	if hlog.IsLogLevel(hlog.DEBUG) {
+		hlog.Log(DEBUG, "VM %s trying to reload with serialized data: %s", vmId, string(pack))
 	}
 
 	pinfo, err := vmDeserialize(pack)
 	if err != nil {
-		client <- &types.VmResponse{
-			VmId:  vmId,
-			Code:  types.E_BAD_REQUEST,
-			Cause: err.Error(),
-		}
-		return
+		return nil, err
+	}
+
+	if hlog.IsLogLevel(hlog.DEBUG) {
+		hlog.Log(DEBUG, "VM %s trying to reload with deserialized pinfo: %#v", vmId, pinfo)
 	}
 
 	if pinfo.Id != vmId {
-		client <- &types.VmResponse{
-			VmId:  vmId,
-			Code:  types.E_BAD_REQUEST,
-			Cause: "VM ID mismatch",
-		}
-		return
+		return nil, fmt.Errorf("VM ID mismatch, %v vs %v", vmId, pinfo.Id)
 	}
 
-	context, err := pinfo.vmContext(hub, client, wg)
+	context, err := pinfo.vmContext(hub, client)
 	if err != nil {
-		client <- &types.VmResponse{
-			VmId:  vmId,
-			Code:  types.E_BAD_REQUEST,
-			Cause: err.Error(),
-		}
-		return
+		return nil, err
 	}
 
-	client <- &types.VmResponse{
-		VmId: vmId,
-		Code: types.E_OK,
+	paused := context.PauseState == PauseStatePaused
+	context.hyperstart, err = libhyperstart.NewHyperstart(context.Id, context.ctlSockAddr(), context.ttySockAddr(), pinfo.HwStat.AttachId, false, paused)
+	if err != nil {
+		context.Log(ERROR, "failed to create hypervisor")
+		return nil, err
 	}
 
 	context.DCtx.Associate(context)
 
-	go waitPts(context)
-	go connectToInit(context)
-	if glog.V(1) {
-		go waitConsoleOutput(context)
+	if context.LogLevel(DEBUG) {
+		go watchVmConsole(context)
 	}
 
-	context.Become(stateRunning, StateRunning)
-
-	for _, c := range context.vmSpec.Containers {
-		context.ptys.ptyConnect(true, c.Process.Terminal, c.Process.Stdio, c.Process.Stderr, nil)
-		context.ptys.startStdin(c.Process.Stdio, c.Process.Terminal)
+	if !paused {
+		go context.watchHyperstart()
 	}
-
 	go context.loop()
+	return context, nil
 }
 
 func InitNetwork(bIface, bIP string, disableIptables bool) error {
-	if HDriver.BuildinNetwork() {
-		return HDriver.InitNetwork(bIface, bIP, disableIptables)
+	if driver, ok := HDriver.(BuildinNetworkDriver); ok {
+		return driver.InitNetwork(bIface, bIP, disableIptables)
 	}
 
 	return network.InitNetwork(bIface, bIP, disableIptables)

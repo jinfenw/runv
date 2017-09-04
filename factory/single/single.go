@@ -16,14 +16,8 @@ func (f Factory) GetVm(cpu, mem int) (*hypervisor.Vm, error) {
 	// check if match the base
 	config := f.Config()
 	if config.CPU > cpu || config.Memory > mem {
-		// also strip unrelated option from @config
-		boot := &hypervisor.BootConfig{
-			CPU:    cpu,
-			Memory: mem,
-			Kernel: config.Kernel,
-			Initrd: config.Initrd,
-		}
-		return hypervisor.GetVm("", boot, false, false)
+		boot := *config
+		return Dummy(boot).GetVm(cpu, mem)
 	}
 
 	vm, err := f.GetBaseVm()
@@ -38,18 +32,18 @@ func (f Factory) GetVm(cpu, mem int) (*hypervisor.Vm, error) {
 	var needOnline bool = false
 	if vm.Cpu < cpu {
 		needOnline = true
-		glog.Info("HotAddCpu for cached Vm")
+		glog.V(3).Info("HotAddCpu for cached Vm")
 		err = vm.SetCpus(cpu)
-		glog.Info("HotAddCpu result %v", err)
+		glog.V(3).Infof("HotAddCpu result %v", err)
 	}
 	if vm.Mem < mem {
 		needOnline = true
-		glog.Info("HotAddMem for cached Vm")
+		glog.V(3).Info("HotAddMem for cached Vm")
 		err = vm.AddMem(mem)
-		glog.Info("HotAddMem result %v", err)
+		glog.V(3).Infof("HotAddMem result %v", err)
 	}
 	if needOnline {
-		glog.Info("OnlineCpuMem for cached Vm")
+		glog.V(3).Info("OnlineCpuMem for cached Vm")
 		vm.OnlineCpuMem()
 	}
 	if err != nil {
@@ -58,3 +52,13 @@ func (f Factory) GetVm(cpu, mem int) (*hypervisor.Vm, error) {
 	}
 	return vm, err
 }
+
+type Dummy hypervisor.BootConfig
+
+func (f Dummy) GetVm(cpu, mem int) (*hypervisor.Vm, error) {
+	config := hypervisor.BootConfig(f)
+	config.CPU = cpu
+	config.Memory = mem
+	return hypervisor.GetVm("", &config, false)
+}
+func (f Dummy) CloseFactory() {}

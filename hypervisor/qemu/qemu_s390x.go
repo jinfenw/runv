@@ -26,20 +26,15 @@ func (qc *QemuContext) arguments(ctx *hypervisor.VmContext) []string {
 	qc.cpus = boot.CPU
 
 	var memParams, cpuParams string
-	if boot.HotAddCpuMem {
-		memParams = fmt.Sprintf("size=%d,slots=1,maxmem=%dM", boot.Memory, hypervisor.DefaultMaxMem) // TODO set maxmem to the total memory of the system
-		cpuParams = fmt.Sprintf("cpus=%d,maxcpus=%d", boot.CPU, hypervisor.DefaultMaxCpus)           // TODO set it to the cpus of the system
-	} else {
-		memParams = strconv.Itoa(boot.Memory)
-		cpuParams = strconv.Itoa(boot.CPU)
-	}
+	memParams = strconv.Itoa(boot.Memory)
+	cpuParams = strconv.Itoa(boot.CPU)
 
 	return []string{
 		"-machine", "s390-ccw-virtio,accel=kvm,usb=off", "-cpu", "host",
 		"-kernel", boot.Kernel, "-initrd", boot.Initrd,
 		"-append", "\"console=ttyS1 panic=1 no_timer_check\"",
 		"-realtime", "mlock=off", "-no-user-config", "-nodefaults", "-enable-kvm",
-		"-rtc", "base=utc,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
+		"-rtc", "base=utc,clock=vm,driftfix=slew", "-no-reboot", "-display", "none", "-boot", "strict=on",
 		"-m", memParams, "-smp", cpuParams,
 		"-qmp", fmt.Sprintf("unix:%s,server,nowait", qc.qmpSockName),
 		"-chardev", fmt.Sprintf("socket,id=charconsole0,path=%s,server,nowait", ctx.ConsoleSockName),

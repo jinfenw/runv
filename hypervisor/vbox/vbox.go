@@ -179,10 +179,10 @@ func (vc *VBoxContext) Dump() (map[string]interface{}, error) {
 	}, nil
 }
 
-func (vc *VBoxContext) Pause(ctx *hypervisor.VmContext, pause bool, result chan<- error) {
+func (vc *VBoxContext) Pause(ctx *hypervisor.VmContext, pause bool) error {
 	err := fmt.Errorf("doesn't support pause for vbox right now")
 	glog.Warning(err)
-	result <- err
+	return err
 }
 
 func (vc *VBoxContext) Shutdown(ctx *hypervisor.VmContext) {
@@ -242,7 +242,7 @@ func (vc *VBoxContext) Stats(ctx *hypervisor.VmContext) (*types.PodStats, error)
 
 func (vc *VBoxContext) Close() {}
 
-func (vc *VBoxContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.BlockDescriptor) {
+func (vc *VBoxContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blockInfo *hypervisor.DiskDescriptor, result chan<- hypervisor.VmEvent) {
 	name := blockInfo.Name
 	filename := blockInfo.Filename
 	id := blockInfo.ScsiId
@@ -251,14 +251,14 @@ func (vc *VBoxContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blo
 	/*
 		if sourceType != "vdi" {
 			glog.Infof("Disk %s (%s) add failed, unsupported source type", name, filename)
-			ctx.Hub <- &hypervisor.DeviceFailed{
+			result <- &hypervisor.DeviceFailed{
 				Session: nil,
 			}
 		}
 	*/
 	m := vc.Machine
 	if m == nil {
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
@@ -272,26 +272,23 @@ func (vc *VBoxContext) AddDisk(ctx *hypervisor.VmContext, sourceType string, blo
 	}
 	if err := m.AttachStorage(m.Name, medium); err != nil {
 		glog.Errorf(err.Error())
-		ctx.Hub <- &hypervisor.DeviceFailed{
+		result <- &hypervisor.DeviceFailed{
 			Session: nil,
 		}
 		return
 	}
 	devName := scsiId2Name(id)
 	callback := &hypervisor.BlockdevInsertedEvent{
-		Name:       name,
-		SourceType: sourceType,
 		DeviceName: devName,
-		ScsiId:     id,
 	}
 
 	glog.V(1).Infof("Disk %s (%s) add succeeded", name, filename)
-	ctx.Hub <- callback
+	result <- callback
 	return
 	//	}()
 }
 
-func (vc *VBoxContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.BlockDescriptor, callback hypervisor.VmEvent) {
+func (vc *VBoxContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervisor.DiskDescriptor, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	filename := blockInfo.Filename
 	id := blockInfo.ScsiId
 
@@ -303,14 +300,14 @@ func (vc *VBoxContext) RemoveDisk(ctx *hypervisor.VmContext, blockInfo *hypervis
 	if err := vc.detachDisk(m.Name, id); err != nil {
 		glog.Warningf("failed to detach the disk of VBox(%s), %s", m.Name, err.Error())
 		/*
-			ctx.Hub <- &hypervisor.DeviceFailed{
+			result <- &hypervisor.DeviceFailed{
 				Session: callback,
 			}
 		*/
 	}
 
 	glog.V(1).Infof("Disk %s remove succeeded", filename)
-	ctx.Hub <- callback
+	result <- callback
 	return
 	//	}()
 }
@@ -342,6 +339,7 @@ func (vc *VBoxContext) RemoveDir(name string) error {
 func (vc *VBoxContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNicInfo, guest *hypervisor.GuestNicInfo, result chan<- hypervisor.VmEvent) {
 	go func() {
 		callback := &hypervisor.NetDevInsertedEvent{
+			Id:         host.Id,
 			Index:      guest.Index,
 			DeviceName: guest.Device,
 			Address:    guest.Busaddr,
@@ -367,7 +365,7 @@ func (vc *VBoxContext) AddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNi
 	}()
 }
 
-func (vc *VBoxContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent) {
+func (vc *VBoxContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.InterfaceCreated, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	go func() {
 		/*
 			args := "vboxmanage controlvm " + vc.Machine.Name + " nic1 null"
@@ -380,21 +378,21 @@ func (vc *VBoxContext) RemoveNic(ctx *hypervisor.VmContext, n *hypervisor.Interf
 			}
 		*/
 		glog.V(1).Infof("nic %s remove succeeded", n.DeviceName)
-		ctx.Hub <- callback
+		result <- callback
 		return
 	}()
 }
 
-func (vc *VBoxContext) SetCpus(ctx *hypervisor.VmContext, cpus int, result chan<- error) {
-	result <- fmt.Errorf("SetCpus is unsupported on virtualbox driver")
+func (vc *VBoxContext) SetCpus(ctx *hypervisor.VmContext, cpus int) error {
+	return fmt.Errorf("SetCpus is unsupported on virtualbox driver")
 }
 
-func (vc *VBoxContext) AddMem(ctx *hypervisor.VmContext, slot, size int, result chan<- error) {
-	result <- fmt.Errorf("AddMem is unsupported on virtualbox driver")
+func (vc *VBoxContext) AddMem(ctx *hypervisor.VmContext, slot, size int) error {
+	return fmt.Errorf("AddMem is unsupported on virtualbox driver")
 }
 
-func (vc *VBoxContext) Save(ctx *hypervisor.VmContext, path string, result chan<- error) {
-	result <- fmt.Errorf("Save is unsupported on virtualbox driver")
+func (vc *VBoxContext) Save(ctx *hypervisor.VmContext, path string) error {
+	return fmt.Errorf("Save is unsupported on virtualbox driver")
 }
 
 // Prepare the conditions for the vm startup
@@ -442,6 +440,10 @@ func (vc *VBoxDriver) SupportLazyMode() bool {
 	return true
 }
 
+func (vc *VBoxDriver) SupportVmSocket() bool {
+	return false
+}
+
 func scsiId2Name(id int) string {
 	return "sd" + utils.DiskId2Name(id)
 }
@@ -456,10 +458,7 @@ func (vc *VBoxContext) LazyAddDisk(ctx *hypervisor.VmContext, name, sourceType, 
 	}
 	devName := scsiId2Name(id)
 	callback := &hypervisor.BlockdevInsertedEvent{
-		Name:       name,
-		SourceType: sourceType,
 		DeviceName: devName,
-		ScsiId:     id,
 	}
 	vc.mediums = append(vc.mediums, medium)
 	vc.callbacks = append(vc.callbacks, callback)
@@ -467,6 +466,7 @@ func (vc *VBoxContext) LazyAddDisk(ctx *hypervisor.VmContext, name, sourceType, 
 
 func (vc *VBoxContext) LazyAddNic(ctx *hypervisor.VmContext, host *hypervisor.HostNicInfo, guest *hypervisor.GuestNicInfo) {
 	callback := &hypervisor.NetDevInsertedEvent{
+		Id:         host.Id,
 		Index:      guest.Index,
 		DeviceName: guest.Device,
 		Address:    guest.Busaddr,

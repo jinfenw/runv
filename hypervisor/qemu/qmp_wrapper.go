@@ -1,3 +1,5 @@
+// +build linux
+
 package qemu
 
 import (
@@ -33,13 +35,16 @@ func defaultRespond(result chan<- hypervisor.VmEvent, callback hypervisor.VmEven
 	}
 }
 
-func newDiskAddSession(ctx *hypervisor.VmContext, qc *QemuContext, name, sourceType, filename, format string, id int) {
+func newDiskAddSession(ctx *hypervisor.VmContext, qc *QemuContext, filename, format string, id int, readonly bool, result chan<- hypervisor.VmEvent) {
+	args := "drive_add dummy file=" + filename + ",if=none,id=" + "drive" + strconv.Itoa(id) + ",format=" + format + ",cache=writeback"
+	if readonly {
+		args += ",readonly"
+	}
 	commands := make([]*QmpCommand, 2)
 	commands[0] = &QmpCommand{
 		Execute: "human-monitor-command",
 		Arguments: map[string]interface{}{
-			"command-line": "drive_add dummy file=" +
-				filename + ",if=none,id=" + "drive" + strconv.Itoa(id) + ",format=" + format + ",cache=writeback",
+			"command-line": args,
 		},
 	}
 	commands[1] = &QmpCommand{
@@ -52,16 +57,13 @@ func newDiskAddSession(ctx *hypervisor.VmContext, qc *QemuContext, name, sourceT
 	devName := scsiId2Name(id)
 	qc.qmp <- &QmpSession{
 		commands: commands,
-		respond: defaultRespond(ctx.Hub, &hypervisor.BlockdevInsertedEvent{
-			Name:       name,
-			SourceType: sourceType,
+		respond: defaultRespond(result, &hypervisor.BlockdevInsertedEvent{
 			DeviceName: devName,
-			ScsiId:     id,
 		}),
 	}
 }
 
-func newDiskDelSession(ctx *hypervisor.VmContext, qc *QemuContext, id int, callback hypervisor.VmEvent) {
+func newDiskDelSession(ctx *hypervisor.VmContext, qc *QemuContext, id int, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	commands := make([]*QmpCommand, 2)
 	commands[1] = &QmpCommand{
 		Execute: "device_del",
@@ -77,11 +79,11 @@ func newDiskDelSession(ctx *hypervisor.VmContext, qc *QemuContext, id int, callb
 	}
 	qc.qmp <- &QmpSession{
 		commands: commands,
-		respond:  defaultRespond(ctx.Hub, callback),
+		respond:  defaultRespond(result, callback),
 	}
 }
 
-func newNetworkDelSession(ctx *hypervisor.VmContext, qc *QemuContext, device string, callback hypervisor.VmEvent) {
+func newNetworkDelSession(ctx *hypervisor.VmContext, qc *QemuContext, device string, callback hypervisor.VmEvent, result chan<- hypervisor.VmEvent) {
 	commands := make([]*QmpCommand, 2)
 	commands[0] = &QmpCommand{
 		Execute: "device_del",
@@ -98,6 +100,6 @@ func newNetworkDelSession(ctx *hypervisor.VmContext, qc *QemuContext, device str
 
 	qc.qmp <- &QmpSession{
 		commands: commands,
-		respond:  defaultRespond(ctx.Hub, callback),
+		respond:  defaultRespond(result, callback),
 	}
 }
